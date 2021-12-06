@@ -60,7 +60,9 @@ sub read
 
             my $cursor = $fh->tell() + $subtable->{'length'} - 12;
 
+            if ($subtable->{'type'} == 1){ $self->read_contextual_subs($subtable, $fh, $cursor); }
             if ($subtable->{'type'} == 2){ $self->read_ligatures($subtable, $fh, $cursor); }
+            if ($subtable->{'type'} == 4){ $self->read_noncontextual_subs($subtable, $fh, $cursor); }
 
             push @{$chain->{'subtables'}}, $subtable;
             $fh->seek($cursor, 0);
@@ -142,55 +144,288 @@ sub read_ligatures
 	$subtable->{'tables'} = $tables;
 }
 
+sub read_contextual_subs
+{
+	my ($self, $subtable, $fh, $endOffset) = @_;
+
+	my $dat;
+	my $start = $fh->tell();
+
+	$fh->read($dat, 5 * 4);
+
+	my $header = {};
+	($header->{'nClasses'},
+	 $header->{'classTableOffset'},
+	 $header->{'stateArrayOffset'},
+	 $header->{'entryTableOffset'},
+	 $header->{'substitutionTable'}) = unpack('NNNNN', $dat);
+	$subtable->{'header'} = $header;
+
+
+	# we'll read the 4 tables, which we can later use to walk
+	# and resolve replacements
+	my $tables = {};
+
+	# read class table
+	my $len = $header->{'stateArrayOffset'} - $header->{'classTableOffset'};
+	$fh->seek($start + $header->{'classTableOffset'}, 0);
+	my ($classFormat, $classLookup) = Font::TTF::AATutils::AAT_read_lookup($fh, 2, $len, 0);
+	$tables->{'classTable'} = $classLookup;
+	$tables->{'classFormat'} = $classFormat;
+
+	# read state array
+	my $len = $header->{'entryTableOffset'} - $header->{'stateArrayOffset'};
+	$fh->seek($start + $header->{'stateArrayOffset'}, 0);
+	my $nStates = $len / (2 * $header->{'nClasses'});
+	$tables->{'stateArray'} = [];
+	for my $i(1..$nStates){
+		$fh->read($dat, $header->{'nClasses'} * 2);
+		push @{$tables->{'stateArray'}}, [unpack('n*', $dat)];
+	}
+
+	# read entry table
+	my $len = $header->{'substitutionTable'} - $header->{'entryTableOffset'};
+	$fh->seek($start + $header->{'entryTableOffset'}, 0);
+	my $entries = $len / 8;
+	$tables->{'entryTable'} = [];
+	for my $i(1..$entries){
+		$fh->read($dat, 8);
+		push @{$tables->{'entryTable'}}, [unpack('nnnn', $dat)];
+	}
+
+	# figure out how many lookup tables we have
+	my $len = $endOffset - $header->{'substitutionTable'};
+
+	$fh->seek($start + $header->{'substitutionTable'}, 0);
+	$fh->read($dat, 4);
+	my ($firstOffset) = unpack('N', $dat);
+	my $lookupTables = $firstOffset / 4;
+
+	# get the offset for each table
+	$fh->seek($start + $header->{'substitutionTable'}, 0);
+	$fh->read($dat, 4*$lookupTables);
+	$tables->{'lookupOffsets'} = [unpack('N*', $dat)];
+
+	my $end_offset = $len - (4*$lookupTables);
+
+	# read each lookup table
+	$tables->{'lookupTables'} = [];
+	for my $i(0..$lookupTables-1){
+		my $tbl_start = $tables->{'lookupOffsets'}->[$i];
+		my $tbl_end = $i == $lookupTables-1 ? $end_offset : $tables->{'lookupOffsets'}->[$i+1];
+		my $tbl_len = $tbl_end - $tbl_start;
+
+		#print "loading lookup table $i, from $tbl_start to $tbl_end\n";
+
+		$fh->seek($start + $header->{'substitutionTable'} + $tbl_start, 0);
+		my ($subFormat, $subLookup) = Font::TTF::AATutils::AAT_read_lookup($fh, 2, $tbl_len, 0);
+
+		$tables->{'lookupTables'}->[$i] = $subLookup;
+	}
+
+	$subtable->{'tables'} = $tables;
+}
+
+sub read_noncontextual_subs
+{
+	my ($self, $subtable, $fh, $endOffset) = @_;
+
+	my $dat;
+	my $start = $fh->tell();
+	my $len = $endOffset - $start;
+
+	my ($format, $table) = Font::TTF::AATutils::AAT_read_lookup($fh, 2, $len, 0);
+
+	$subtable->{'lookupTable'} = {};
+
+	# only keep ones which actually make changes
+	for my $k(keys %{$table}){
+		if ($k != $table->{$k}){
+			$subtable->{'lookupTable'}->{$k} = $table->{$k};
+		}
+	}
+}
+
 sub resolve_ligature {
 	my ($self, $cps) = @_;
 
-	for my $chain_id(0..scalar(@{$self->{'header'}->{'chains'}})-1){
-		#print "scanning chain ${chain_id}...\n";
 
-		for my $subtable_id(0..scalar(@{$self->{'header'}->{'chains'}->[$chain_id]->{'subtables'}})-1){
+	# first, turn cp list into glyph list
 
-			#print "  scanning subtable ${subtable_id}...\n";
+	my $cmap = $self->{' PARENT'}->{'cmap'};
 
-			my $ret = $self->resolve_ligature_table($cps, $self->{'header'}->{'chains'}->[$chain_id]->{'subtables'}->[$subtable_id]);
-			return $ret if $ret;
-		}
+	my $glyphs = [];
+	for my $cp (@{$cps}){
+		my $index = $cmap->{'Tables'}[0]{'val'}->{$cp};
+		if (!$index){ return 0; }
+		push @{$glyphs}, $index;
 	}
 
+
+	return $self->resolve_glyph_list($glyphs);
+}
+
+sub resolve_glyph_list {
+	my ($self, $glyphs) = @_;
+
+	#print "processing @{$glyphs}\n";
+
+	# now, loop over each chain, applying transforms
+
+	my $ever_transformed = 0;
+
+	for my $chain_id(0..scalar(@{$self->{'header'}->{'chains'}})-1){
+
+		# for each chain, determine our feature flags so we know which subtables to process
+
+		my $chain = $self->{'header'}->{'chains'}->[$chain_id];
+
+		my $featureFlags = $self->getChainFeatureFlags($chain, {});		
+
+
+		while (1){
+
+			my $transformed = 0;
+
+			#print "scanning chain ${chain_id}...\n";
+
+
+			my $subtables = $chain->{'subtables'};
+			my @ids = (0 .. scalar(@{$subtables}) - 1);
+
+			for my $subtable_id(@ids){
+
+				my $subtable = $subtables->[$subtable_id];
+
+				if (($subtable->{'subFeatureFlags'} & $featureFlags) == 0){
+					#print "  skipping subtable ${subtable_id}\n";
+					next;
+				}
+
+				#print "  scanning subtable ${subtable_id} (type $subtable->{'type'})...\n";
+
+				# resolve ligatures
+				if ($subtable->{'type'} == 2){
+					while (1){
+						my $ret = $self->resolve_subligature_table($glyphs, $subtable);
+						if (scalar @{$ret}){
+							#print "    changed (lig) to @{$ret}\n";
+							$transformed = 1;
+							$glyphs = $ret;
+						}else{
+							last;
+						}
+					}
+				}
+
+				# resolve contextual swaps
+				if ($subtable->{'type'} == 1){
+					while (1){
+						my $ret = $self->resolve_contextual_table($glyphs, $subtable);
+						if (scalar @{$ret}){
+							#print "    changed (con) to @{$ret}\n";
+							$transformed = 1;
+							$glyphs = $ret;
+						}else{
+							last;
+						}
+					}
+				}
+
+				# resolve non-contextual swaps
+				if ($subtable->{'type'} == 4){
+					while (1){
+						my $ret = $self->resolve_noncontextual_table($glyphs, $subtable);
+						if (scalar @{$ret}){
+							#print "    changed (ncn) to @{$ret}\n";
+							$transformed = 1;
+							$glyphs = $ret;
+						}else{
+							last;
+						}
+					}
+				}
+
+			}
+
+			if ($transformed){ $ever_transformed = 1; }
+			if (!$transformed){ last; }
+		}
+
+	}
+
+	if ($ever_transformed){
+		return $glyphs;
+	}
+
+	#print "reached end of processing...\n";
 	return 0;
 }
 
+sub resolve_subligature_table {
+	my ($self, $glyphs, $table) = @_;
+
+	my $pre = [];
+	my $post = [];
+
+	push @{$pre}, $_ for @{$glyphs};
+
+	while (scalar @{$pre}){
+
+		my $ret = $self->resolve_ligature_table($pre, $table);
+		if (scalar @{$ret}){
+
+			my $out = [];
+			push @{$out}, $_ for @{$ret};
+			unshift @{$out}, $_ for @{$post};
+
+			return $out;
+		}
+
+		unshift(@{$post}, shift(@{$pre}));
+	}
+
+	return [];
+}
+
 sub resolve_ligature_table {
-	my ($self, $cps, $table) = @_;
+	my ($self, $glyphs, $table) = @_;
 
 	#
 	# only resolve from ligature subtables, not swashes, etc.
 	#
 
 	if ($table->{'type'} != 2){
-		#print "not a lig table\n";
-		return 0;
+		#print "not a lig table (type=$table->{'type'}, length=$table->{'length'})\n";
+		return [];
 	}
 
-
 	#
-	# we need the cmap for getting the cp indexes
-	#
-
-	my $cmap = $self->{' PARENT'}->{'cmap'};
-
-
-	#
-	# we reverse the codepoints into a stack and change them from codepoints to character indexes.
+	# we reverse the glyphs into a stack, with classes.
 	# start with $state of 1. if we get back to state 0 or 1 then give up.
 	#
 
 	my $stack = [];
-	for my $cp (@{$cps}){
-		my $index = $cmap->{'Tables'}[0]{'val'}->{$cp};
+	my $post = [];
+	my $reached_end = 0;
+
+	for my $index (@{$glyphs}){
+		if ($reached_end){
+			push @{$post}, $index;
+			next;
+		}
+
 		my $class = $table->{'tables'}->{'classTable'}->{$index};
 
-		if (!$index || !$class){ return 0; }
+		if (!$class){
+			if (!scalar @{$stack}){
+				return [];
+			}
+
+			$reached_end = 1;
+			push @{$post}, $index;
+			next;
+		}
 
 		unshift @{$stack}, [$index, $class];
 	}
@@ -211,6 +446,8 @@ sub resolve_ligature_table {
 		#print "state $state: idx $next, cls $class, ent $entry\n";
 
 		my ($next_state, $flags, $action) = @{$table->{'tables'}->{'entryTable'}->[$entry]};
+
+		#printf "\tflags: %x\n", $flags;
 
 		if ($flags & 0x8000){
 			push @{$proc_stack}, $next;
@@ -249,22 +486,135 @@ sub resolve_ligature_table {
 					#print "\n";
 
 					#print Dumper $table->{'tables'}->{'ligatures'};
+					my $out = [$glyph];
+					while (scalar(@{$stack})){
+						my ($final_idx, $final_class) = @{pop @{$stack}};
+						unshift @{$out}, $final_idx;
+					}
+					while (scalar(@{$post})){
+						push @{$out}, shift @{$post};
+					}
 
-					return $glyph;
+					return $out;
 				}
 			}
 
 			#print Dumper $table->{'tables'}->{'ligActions'};
-			return 0;
+			return [];
 		}
 
 		$state = $next_state;
 		if ($state == 0 || $state == 1){
-			return 0;
+		#	return [];
 		}
 	}
 
-	return 0;
+	return [];
+}
+
+sub resolve_contextual_table {
+	my ($self, $glyphs, $table) = @_;
+
+	#
+	# only resolve from contextual subtables, not swashes, etc.
+	#
+
+	if ($table->{'type'} != 1){
+		#print "not a contextual table (type=$table->{'type'}, length=$table->{'length'})\n";
+		return [];
+	}
+
+
+	#
+	# we reverse the glyphs into a stack.
+	# start with $state of 1. if we get back to state 0 or 1 then give up.
+	#
+
+	my $stack = [];
+	for my $index (@{$glyphs}){
+		my $class = $table->{'tables'}->{'classTable'}->{$index};
+
+		if (!$class){ return []; }
+
+		unshift @{$stack}, [$index, $class];
+	}
+
+	my $state = 1;
+	my $mark = [];
+	my $out_stack = [];
+
+
+	#
+	# now loop
+	#
+
+	while (scalar(@{$stack})){
+
+		my ($next, $class) = @{pop @{$stack}};
+		my $entry = $table->{'tables'}->{'stateArray'}->[$state]->[$class];
+
+		#print "state $state: idx $next, cls $class, ent $entry\n";
+
+		my ($next_state, $flags, $markIndex, $currentIndex) = @{$table->{'tables'}->{'entryTable'}->[$entry]};
+
+		#printf "\tnext: %d, flags: %04x, mark: %d, current: %d\n", $next_state, $flags, $markIndex, $currentIndex;
+
+		if ($markIndex != 0xffff){
+			my $replace = $table->{'tables'}->{'lookupTables'}->[$markIndex]->{$mark->[0]};
+			push @{$out_stack}, $replace;
+
+			#print "\treplace mark ($mark->[0]/$mark->[1]) from table $markIndex\n";
+			#print "\t\treplacement is $replace\n";
+		}
+
+		if ($currentIndex != 0xffff){
+			my $replace = $table->{'tables'}->{'lookupTables'}->[$currentIndex]->{$next};
+			push @{$out_stack}, $replace;
+
+			#print "\treplace current ($next/$class) from table $currentIndex\n";
+			#print "\t\treplacement is $replace\n";
+		}
+
+
+		if ($flags & 0x8000){
+			#print "SET MARK\n";
+			$mark = [$next, $class];
+		}
+		if ($flags & 0x4000){
+			#print "don't advance\n";
+			push @{$stack}, [$next, $class];
+		}
+
+		$state = $next_state;
+	}
+
+	if (scalar @{$out_stack}){
+		return $out_stack;
+	}
+
+	#print "exited - stack empty\n";
+	return [];
+}
+
+sub resolve_noncontextual_table
+{
+	my ($self, $glyphs, $table) = @_;
+
+	my $matched = 0;
+
+	my $out = [];
+	for my $idx(@{$glyphs}){
+		my $map = $table->{'lookupTable'}->{$idx};
+		if ($map){
+			if ($map != 0xffff){
+				push @{$out}, $map;
+			}
+			$matched = 1;
+		}else{
+			push @{$out}, $idx;
+		}
+	}
+	return $matched ? $out : [];
 }
 
 sub sign_extend_30 {
@@ -280,5 +630,22 @@ sub sign_extend_30 {
 	return $num;
 }
 
+sub getChainFeatureFlags {
+	my ($self, $chain, $settings) = @_;
+
+	my $state = $chain->{'defaultFlags'};
+
+	for my $feature (@{$chain->{'features'}}){
+
+		my $setting = $settings->{$feature->{'featureType'}} | 0;
+		if ($setting == $feature->{'featureSetting'}){
+
+			$state &= $feature->{'disableFlags'};
+			$state |= $feature->{'enableFlags'};
+		}
+	}
+
+	return $state;
+}
 
 1;

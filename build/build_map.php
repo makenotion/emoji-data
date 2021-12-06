@@ -69,11 +69,13 @@
 	#
 
 	$category_map = array();	# CP => (Category-name, Global-order)
-	$categories = array();		# Category-name => []
+	$subcategory_map = array();	# CP => (Subcategory-name, Global-order)
 	$qualified_map = array();	# non-qualified-CP => fully-qualified-CP
+	$categories = array();		# Category-name => Subcategory-name => []
 
 	$lines = file('unicode/emoji-test.txt');
 	$last_cat = '?';
+	$last_subcat = '?';
 	$p = 1;
 	foreach ($lines as $line){
 		if (!strlen(trim($line))) continue;
@@ -81,6 +83,9 @@
 		if (substr($line, 0, 9) == '# group: '){
 			$last_cat = substr($line, 9);
 			$categories[$last_cat] = array();
+        }elseif (substr($line, 0, 12) == '# subgroup: '){
+			$last_subcat = substr($line, 12);
+			$categories[$last_cat][$last_subcat] = array();
 		}elseif (substr($line, 0, 1) == '#'){
 			continue;
 		}else{
@@ -88,19 +93,13 @@
 			$cp = trim(StrToLower($cp));
 			$cp = preg_replace('!\s+!', '-', $cp);
 			$category_map[$cp] = array($last_cat, $p);
+			$subcategory_map[$cp] = array($last_subcat, $p);
 			$p++;
 
 			$cp_nq = str_replace('-fe0f', '', $cp);
 			if ($cp != $cp_nq) $qualified_map[$cp_nq] = $cp;
 		}
 	}
-
-	# add categories for the skin tone patches
-	$category_map['1f3fb'] = array('Skin Tones', $p++);
-	$category_map['1f3fc'] = array('Skin Tones', $p++);
-	$category_map['1f3fd'] = array('Skin Tones', $p++);
-	$category_map['1f3fe'] = array('Skin Tones', $p++);
-	$category_map['1f3ff'] = array('Skin Tones', $p++);
 
 	# patch in some CPs missing from the data file
 	$qualified_map['0023-20e3'] = '0023-fe0f-20e3';
@@ -195,6 +194,8 @@
 	load_short_names('data_emoji_names_v5.txt');
 	load_short_names('data_emoji_names_v11.txt');
 	load_short_names('data_emoji_names_v12.txt');
+	load_short_names('data_emoji_names_v13.txt');
+	load_short_names('data_emoji_names_v13_1.txt');
 	echo "DONE\n";
 
 	function load_short_names($file){
@@ -219,6 +220,20 @@
 		}
 	}
 
+	#
+	# Token expansion in name files:
+	#
+	# {MAN/WOMAN} -> 1F468/1F469
+	# {MALE/FEMALE} -> 2642-FE0F/2640-FE0F
+	# {GENDER} -> male/female
+	# {M/W} -> man/woman
+	#
+	# {SKIN}	- optional skin tone
+	# {SKIN!}	- non-optional skin tone
+	# {SKIN2}	- second (non-optional) skin tone, not allowing matches with the first skin tone
+	# {SKIN2x}	- second (non-optional) skin tone, allowing matches with the first skin tone
+	#
+
 	function expand_short_name_line($line){
 
 		# expand gender first
@@ -232,7 +247,7 @@
 		}
 
 		# expand optional and required skin tones
-		if (preg_match('#{SKIN[!2]?}#', $line, $m)){
+		if (preg_match('#{SKIN(!|2|2x)?}#', $line, $m)){
 			return expand_skin_choices(array($line));
 		}
 
@@ -244,13 +259,13 @@
 	function expand_skin_choices($lines){
 
 		# given a list of lines, expand the list my multiplying out skin tones.
-		# we can take multiple passes is there are multiple matching tags.
+		# we can take multiple passes if there are multiple matching tags.
 
 		$out = array();
 
 		foreach ($lines as $line){
 
-			if (preg_match('#{SKIN[!2]?}#', $line, $m)){
+			if (preg_match('#{SKIN(!|2|2x)?}#', $line, $m)){
 
 				$temp = [];
 				if ($m[0] == '{SKIN}'){
@@ -262,6 +277,12 @@
 					if (strpos($line, '-1F3FD') === false) $temp[] = preg_replace('#{SKIN2}#', '-1F3FD', $line, 1).':skin-4';
 					if (strpos($line, '-1F3FE') === false) $temp[] = preg_replace('#{SKIN2}#', '-1F3FE', $line, 1).':skin-5';
 					if (strpos($line, '-1F3FF') === false) $temp[] = preg_replace('#{SKIN2}#', '-1F3FF', $line, 1).':skin-6';
+				}elseif ($m[0] == '{SKIN2x}'){
+					$temp[] = preg_replace('#{SKIN2x}#', '-1F3FB', $line, 1).':skin-2';
+					$temp[] = preg_replace('#{SKIN2x}#', '-1F3FC', $line, 1).':skin-3';
+					$temp[] = preg_replace('#{SKIN2x}#', '-1F3FD', $line, 1).':skin-4';
+					$temp[] = preg_replace('#{SKIN2x}#', '-1F3FE', $line, 1).':skin-5';
+					$temp[] = preg_replace('#{SKIN2x}#', '-1F3FF', $line, 1).':skin-6';
 				}else{
 					$temp[] = preg_replace('#{SKIN!?}#', '-1F3FB', $line, 1).':skin-2';
 					$temp[] = preg_replace('#{SKIN!?}#', '-1F3FC', $line, 1).':skin-3';
@@ -305,7 +326,7 @@
 
 	foreach ($raw as $line){
 		list($line, $junk) = explode('#', $line);
-		list($key, $var) = explode(';', StrToUpper(trim($line)));
+		list($key, $var) = explode(';', mb_strtoupper(trim($line)));
 		if (strlen($key)){
 			$obsoleted_by[$key] = $var;
 			$obsoletes[$var] = $key;
@@ -359,12 +380,13 @@
 
 	$out = array();
 	$out_unis = array();
+	$out_skins = array();
 	$c = 0;
 
 	foreach ($catalog as $row){
 
 		$img_key = StrToLower(encode_points($row['unicode']));
-		$shorts = $short_names[StrToUpper($img_key)];
+		$shorts = $short_names[mb_strtoupper($img_key)];
 		$name = $row['char_name']['title'];
 
 		if (preg_match("!^REGIONAL INDICATOR SYMBOL LETTERS !", $name)){
@@ -403,7 +425,7 @@
 
 			add_row($img_key, $names, array(
 				'unified'	=> $uid,
-				'name'		=> "REGIONAL INDICATOR SYMBOL LETTERS ".StrToUpper(substr($names[0], 5)),
+				'name'		=> "REGIONAL INDICATOR SYMBOL LETTERS ".mb_strtoupper(substr($names[0], 5)),
 			));
 		}else{
 			add_row($img_key, $names);
@@ -466,7 +488,7 @@
 
 		if (isset($GLOBALS['skip_components'][$hex_low])) continue;
 
-		$hex_up = StrToUpper($hex_low);
+		$hex_up = mb_strtoupper($hex_low);
 		$line = shell_exec("grep -e ^{$hex_up}\\; unicode/UnicodeData.txt");
 		$line = trim($line);
 
@@ -493,11 +515,11 @@
 		# single codepoints are not a sequence
 		if (count($cps) == 1) return;
 
-		# skip skin tone variations - we treat those specially
-		if (in_array($last, $GLOBALS['skin_variation_suffixes'])) return;
-
 		# is this already on the output list?
 		if ($GLOBALS['out_unis'][$hex_low]) return;
+
+		# is this already on the output list for skin tone variations?
+		if ($GLOBALS['out_skins'][$hex_low]) return;
 
 		# is this an explicit variation we've already added to the output map?
 		if ($GLOBALS['variations_handled'][$hex_low]) return;
@@ -691,10 +713,10 @@
 		}
 
 		if (!isset($props['name'])){
-			$props['name'] = $GLOBALS['names_map'][StrToUpper($img_key)];
+			$props['name'] = $GLOBALS['names_map'][mb_strtoupper($img_key)];
 		}
 		if (!isset($props['unified'])){
-			$props['unified'] = StrToUpper($img_key);
+			$props['unified'] = mb_strtoupper($img_key);
 		}
 
 		$row = simple_row($img_key, $short_names, $props);
@@ -717,7 +739,7 @@
 
 		$nq = null;
 		if ($GLOBALS['rev_qualified_map'][$img_key]){
-			$nq = StrToUpper($GLOBALS['rev_qualified_map'][$img_key]);
+			$nq = mb_strtoupper($GLOBALS['rev_qualified_map'][$img_key]);
 			if (!$added){
 				$added = $GLOBALS['versions'][StrToLower($nq)];
 			}
@@ -742,6 +764,13 @@
 			return null;
 		}
 
+		$subcategory = $GLOBALS['subcategory_map'][$img_key];
+		// TODO: Make sure every emoji has a subcategory!
+ 		if (!$subcategory) {
+			print "\nNot in subcategory map! $img_key\n";
+			return null;
+		}
+
 		if ($props['name']){
 			if (preg_match("!^REGIONAL INDICATOR SYMBOL LETTERS !", $props['name'])){
 
@@ -753,6 +782,10 @@
 						$props['name'] = $GLOBALS['sequence_names'][$img_key].' Flag';
 					}
 				}
+			}
+		}else{
+			if ($GLOBALS['sequence_names'][$img_key]){
+				$props['name'] = mb_strtoupper($GLOBALS['sequence_names'][$img_key]);
 			}
 		}
 
@@ -773,6 +806,7 @@
 			'text'		=> $GLOBALS['text'][$short],
 			'texts'		=> $GLOBALS['texts'][$short],
 			'category'	=> is_array($category) ? $category[0] : null,
+			'subcategory'	=> is_array($subcategory) ? $subcategory[0] : null,
 			'sort_order'	=> is_array($category) ? $category[1] : null,
 			'added_in'	=> $added,
 		);
@@ -802,15 +836,16 @@
 
 			foreach ($GLOBALS['skin_variation_suffixes'] as $suffix){
 
-				$var_uni	= StrToUpper($skin_vars_base.'-'.$suffix);
+				$var_uni	= mb_strtoupper($skin_vars_base.'-'.$suffix);
 				$var_img_key	= StrToLower($skin_vars_base.'-'.$suffix);
 				$var_img	= $var_img_key.'.png';
 
 				$var_nq = null;
 				if ($GLOBALS['rev_qualified_map'][$var_img_key]){
-					$var_nq = StrToUpper($GLOBALS['rev_qualified_map'][$var_img_key]);
+					$var_nq = mb_strtoupper($GLOBALS['rev_qualified_map'][$var_img_key]);
 				}
 
+				$GLOBALS['out_skins'][$var_img_key] = 1;
 
 				$variation = array(
 					'unified'		=> $var_uni,
@@ -844,16 +879,18 @@
 
 	foreach ($out as $k => $row){
 		$shortname_map[$row['short_name']] = $k;
-		if ($row['category']){
+		if ($row['category'] && $row['subcategory']){
 			$sort_key = sprintf('%05d', $row['sort_order']).'_'.$row['short_name'];
-			$categories[$row['category']][$sort_key] = $row['short_name'];
+			$categories[$row['category']][$row['subcategory']][$sort_key] = $row['short_name'];
 		}else{
 			$missing_categories[$row['short_name']] = 1;
 		}
 	}
-	foreach ($categories as $k => $v){
-		ksort($v);
-		$categories[$k] = array_values($v);
+	foreach ($categories as $k1 => $subcats){
+		foreach ($subcats as $k2 => $v){
+			ksort($v);
+			$categories[$k1][$k2] = array_values($v);
+		}
 	}
 
 
@@ -872,9 +909,9 @@
 		if ($row['obsoletes']){
 			$idx = $cp_map[$row['obsoletes']];
 			$row2 = $out[$idx];
-			$cat = find_assigned_cat($row2['short_name']);
-			if ($cat){
-				$categories[$cat][] = $row['short_name'];
+			list($cat, $subcat) = find_assigned_cat($row2['short_name']);
+			if ($cat && $subcat){
+				$categories[$cat][$subcat][] = $row['short_name'];
 				unset($missing_categories[$row['short_name']]);
 			}
 		}
@@ -882,9 +919,9 @@
 		if ($row['obsoleted_by']){
 			$idx = $cp_map[$row['obsoleted_by']];
 			$row2 = $out[$idx];
-			$cat = find_assigned_cat($row2['short_name']);
-			if ($cat){
-				$categories[$cat][] = $row['short_name'];
+			list($cat, $subcat) = find_assigned_cat($row2['short_name']);
+			if ($cat && $subcat){
+				$categories[$cat][$subcat][] = $row['short_name'];
 				unset($missing_categories[$row['short_name']]);
 			}
 		}
@@ -892,12 +929,14 @@
 
 	function find_assigned_cat($short_name){
 		global $categories;
-		foreach ($categories as $cat => $ids){
-			foreach ($ids as $id){
-				if ($id == $short_name) return $cat;
+		foreach ($categories as $cat => $subcats){
+			foreach ($subcats as $subcat => $ids){
+				foreach ($ids as $id){
+					if ($id == $short_name) return array($cat, $subcat);
+				}
 			}
 		}
-		return null;
+		return array(null, null);
 	}
 
 	echo "DONE\n";
@@ -918,16 +957,17 @@
 
 
 	#
-	# apply categories back into the output hash
+	# apply global sort ordering back into the output hash
 	#
 
-	echo "Setting categories : ";
-
-	foreach ($categories as $cat => $names){
-		foreach ($names as $p => $name){
-			$index = $shortname_map[$name];
-			$out[$index]['category'] = $cat;
-			$out[$index]['sort_order'] = $p+1;
+	echo "Setting global sort order : ";
+	$z = 1;
+	foreach ($categories as $cat => $subcats){
+		foreach ($subcats as $subcat => $names){
+			foreach ($names as $p => $name){
+				$index = $shortname_map[$name];
+				$out[$index]['sort_order'] = $z++;
+			}
 		}
 	}
 
@@ -940,9 +980,15 @@
 
 	echo "Saving categories : ";
 
-	$fh = fopen('../categories.json', 'w');
-	fwrite($fh, json_encode($categories, JSON_PRETTY_PRINT));
-	fclose($fh);
+	$json_cat = json_encode($categories, JSON_PRETTY_PRINT);
+	if ($json_cat) {
+		$fh = fopen('../categories.json', 'w');
+		fwrite($fh, $json_cat);
+		fclose($fh);
+	} else {
+		$json_err = json_last_error();
+		echo "\nERROR: json encode error: {$json_err}\n";
+	}
 
 	echo "DONE\n";
 
@@ -981,7 +1027,7 @@
 	$total = 0;
 	foreach ($out as $row){
 		$total++;
-		$total += count($row['skin_variations']);
+		$total += isset($row['skin_variations']) ? count($row['skin_variations']) : 0;
 	}
 	$num = ceil(sqrt($total));
 
@@ -995,7 +1041,7 @@
 			$y = 0;
 		}
 
-		if (count($out[$k]['skin_variations'])){
+		if (isset($out[$k]['skin_variations']) && count($out[$k]['skin_variations'])){
 			foreach ($out[$k]['skin_variations'] as $k2 => $v2){
 				$out[$k]['skin_variations'][$k2]['sheet_x'] = $x;
 				$out[$k]['skin_variations'][$k2]['sheet_y'] = $y;
@@ -1018,18 +1064,30 @@
 
 	echo "Writing map : ";
 
-	$fh = fopen('../emoji.json', 'w');
-	fwrite($fh, json_encode($out));
-	fclose($fh);
+	$json_emoji = json_encode($out);
+	if ($json_emoji) {
+		$fh = fopen('../emoji.json', 'w');
+		fwrite($fh, $json_emoji);
+		fclose($fh);
+	} else {
+		$json_err = json_last_error();
+		echo "\nERROR: json encode error: {$json_err}\n";
+	}
 
 	echo "DONE\n";
 
 
 	echo "Writing pretty map : ";
 
-	$fh = fopen('../emoji_pretty.json', 'w');
-	fwrite($fh, json_encode($out, JSON_PRETTY_PRINT));
-	fclose($fh);
+	$json_pretty = json_encode($out, JSON_PRETTY_PRINT);
+	if ($json_pretty) {
+		$fh = fopen('../emoji_pretty.json', 'w');
+		fwrite($fh, $json_pretty);
+		fclose($fh);
+	} else {
+		$json_err = json_last_error();
+		echo "\nERROR: json encode error: {$json_err}\n";
+	}
 
 	echo "DONE\n";
 

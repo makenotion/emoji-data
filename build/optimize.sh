@@ -111,8 +111,8 @@ zopfli() {
 		FILTERS="--filters=bp"
 	fi
 
-	#CMD="/usr/local/bin/zopflipng --timelimit=$TIMELIMIT"
-	CMD="/usr/local/bin/zopflipng"
+	#CMD="/usr/bin/zopflipng --timelimit=$TIMELIMIT"
+	CMD="/usr/bin/zopflipng"
 	if [ $ITERATIONS -gt 0 ]; then
 		CMD="$CMD --iterations=$ITERATIONS"
 	fi
@@ -169,33 +169,33 @@ do
 	LABEL="start   "
 	show_size
 
-	IN=$OUT
-	OUT="$TMP/step1.png"
-	LABEL="pngcrush"
-	FLAG=$USE_PNGCRUSH
-	pngcrush
-	execute_step
+	#IN=$OUT
+	#OUT="$TMP/step1.png"
+	#LABEL="pngcrush"
+	#FLAG=$USE_PNGCRUSH
+	#pngcrush
+	#execute_step
 
-	IN=$OUT
-	OUT="$TMP/step2.png"
-	LABEL="optipng "
-	FLAG=$USE_OPTIPNG
-	optipng
-	execute_step
+	#IN=$OUT
+	#OUT="$TMP/step2.png"
+	#LABEL="optipng "
+	#FLAG=$USE_OPTIPNG
+	#optipng
+	#execute_step
 
-	IN=$OUT
-	OUT="$TMP/step3.png"
-	LABEL="pngout  "
-	FLAG=$USE_PNGOUT
-	pngout
-	execute_step
+	#IN=$OUT
+	#OUT="$TMP/step3.png"
+	#LABEL="pngout  "
+	#FLAG=$USE_PNGOUT
+	#pngout
+	#execute_step
 
-	IN=$OUT
-	OUT="$TMP/step4.png"
-	LABEL="advpng  "
-	FLAG=$USE_ADVPNG
-	advpng
-	execute_step
+	#IN=$OUT
+	#OUT="$TMP/step4.png"
+	#LABEL="advpng  "
+	#FLAG=$USE_ADVPNG
+	#advpng
+	#execute_step
 
 	IN=$OUT
 	OUT="$TMP/step5.png"
